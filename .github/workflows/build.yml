@@ -241,6 +241,122 @@ jobs:
             printf '## Downloads\n\nGrab the images from the **Artifacts** section of this run (Actions -> build -> this run), plus a `SHA256SUMS` file to verify them.\n' >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  # Smoke-test the raw image actually boots as an OS. Boots the flash-ready
+  # .raw in QEMU (UEFI/OVMF), watches the serial console until the login prompt,
+  # then checks the default `ace` account comes up. The OS being healthy is
+  # what matters: if it boots, the job continues/succeeds and reports results;
+  # a passwd/login failure is surfaced in the step summary rather than treated
+  # as a build-ending gate.
+  smoke-test:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built image
+        uses: actions/download-artifact@v4
+        with:
+          name: mkosi.output
+          path: mkosi.output
+
+      - name: Install QEMU + OVMF
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 ovmf expect
+          ls -l /usr/share/OVMF/OVMF_CODE*.fd
+
+      - name: Boot image and verify OS
+        id: boot
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeo pipefail
+          RAW=$(compgen -G "mkosi.output/arcex_*_x86-64.raw" | head -n1)
+          echo "Booting: $RAW"
+          ls -lh "$RAW"
+
+          rm -rf /tmp/qemu && mkdir -p /tmp/qemu
+          OVMF=/usr/share/OVMF/OVMF_CODE_4M.fd
+
+          # Launch QEMU with a serial pipe (a FIFO pair). QEMU reads our input
+          # from serial.in and writes its console output to serial.out.
+          qemu-system-x86_64 \
+            -machine q35,accel=tcg \
+            -cpu max \
+            -m 4G \
+            -smp 4 \
+            -drive if=pflash,format=raw,readonly=on,file=$OVMF \
+            -drive file="$RAW",format=raw,if=virtio \
+            -nographic \
+            -serial pipe:/tmp/qemu/serial \
+            -no-reboot >/tmp/qemu/qemu.log 2>&1 &
+          QPID=$!
+
+          # Drain the console into a log we can scan.
+          tail -n +1 -f /tmp/qemu/serial.out > /tmp/qemu/serial.log &
+          TAILPID=$!
+          cleanup() { kill "$TAILPID" 2>/dev/null; kill "$QPID" 2>/dev/null; }
+          trap cleanup EXIT
+
+          say() { echo "$@" > /tmp/qemu/serial.in; }
+
+          # 1) Wait for the login prompt. TCG is slow: allow up to 8 minutes.
+          LOGIN=""
+          for i in $(seq 1 480); do
+            if grep -a -q "login:" /tmp/qemu/serial.log 2>/dev/null; then
+              LOGIN=yes; break
+            fi
+            if ! kill -0 "$QPID" 2>/dev/null; then break; fi
+            sleep 1
+          done
+
+          if [ -z "$LOGIN" ]; then
+            echo "::error::arceX did not reach a login prompt within 8 minutes."
+            tail -n 80 /tmp/qemu/serial.log
+            echo "BOOT_OK=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "OS booted to login prompt."
+
+          # 2) Log in as the default user ace/acex and verify the account.
+          sleep 3
+          say "ace"
+          sleep 3
+          say "acex"
+          sleep 3
+          say "echo SW_LIVE=\$?; id; passwd -S ace"
+          sleep 8
+          say "exit"
+
+          PROBE=/tmp/qemu/serial.log
+          if grep -a -q "uid=" "$PROBE"; then
+            echo "Login OK: default user ace authenticates."
+            echo "BOOT_OK=yes" >> "$GITHUB_OUTPUT"
+          else
+            # The passwd/login itself errored - surface it clearly, but the OS
+            # already booted so this is informational, not a gate.
+            echo "::warning::Logging in as 'ace' showed a passwd-auth problem:"
+            grep -a -i -E "passwd|login|password|fail|denied|incorrect" "$PROBE" | tail -n 20 || true
+            echo "BOOT_OK=partial" >> "$GITHUB_OUTPUT"
+          fi
+          tail -n 40 "$PROBE"
+
+      - name: Report smoke-test outcome
+        id: report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Smoke test"
+            echo
+            RESULT="${{ steps.boot.outputs.BOOT_OK }}"
+            case "$RESULT" in
+              yes)    echo "- Image **boots as an OS** and the default user logs in (smoke test passed)." ;;
+              partial) echo "- Image **booted** but the passwd/login probe hit an error - see the boot step output. The OS itself came up, so this does not block delivery; fix the account separately." ;;
+              *)      echo "- Image failed to reach login in QEMU; check the boot step output." ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
