@@ -1,0 +1,22 @@
+# build artifacts
+out/
+_src/
+*.img
+*.squashfs
+*.erofs
+*.raw
+*.tar.zst
+*.manifest.json
+*.sig
+mkosi.output/
+
+# local scratch
+/scratch/
+/tmp/
+
+# keys (never commit)
+keys/
+*.key
+*.pub
+.opencode
+.

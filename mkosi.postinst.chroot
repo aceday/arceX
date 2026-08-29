@@ -1,0 +1,99 @@
+#!/bin/bash
+
+set -e
+
+cat << 'EOF' > /usr/lib/systemd/system-preset/90-arcex.preset
+enable NetworkManager.service
+enable bluetooth.service
+enable bolt.service
+enable power-profiles-daemon.service
+enable alsa-restore.service
+disable systemd-networkd.service
+disable systemd-networkd.socket
+enable systemd-resolved.service
+enable systemd-timesyncd.service
+enable fstrim.timer
+enable smartd.service
+enable nix-daemon.socket
+enable nix-daemon.service
+EOF
+
+mkdir -p /var/lib/extensions
+mkdir -p /var/log
+
+# Nix store lives at /nix (Arch nix package defaults). This is a plain
+# directory on the writable root (btrfs) partition - it survives /usr
+# erofs updates since only /usr is rewritten. The package's tmpfiles
+# lines create /nix/var/nix/{daemon-socket,builds} at boot; pre-create
+# the rest so the daemon unit's RequiresMountsFor/Condition* are happy.
+mkdir -p /nix/store
+mkdir -p /nix/var/nix/db
+chown -R root:root /nix
+
+# Make sure the nixbld* build users exist in the baked image.
+systemd-sysusers || true
+
+groupadd -f wheel
+useradd --create-home --groups wheel --shell /usr/bin/fish ace
+echo 'ace:acex' | chpasswd
+grep -qxF '/usr/bin/fish' /etc/shells || echo '/usr/bin/fish' >> /etc/shells
+printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-arcex-wheel
+chmod 440 /etc/sudoers.d/10-arcex-wheel
+
+# sddm (nix-installed display manager) needs a system user to drop to.
+if ! id sddm >/dev/null 2>&1; then
+    useradd --system --no-create-home -d /var/lib/sddm -s /usr/bin/nologin sddm
+    install -d -o sddm -g sddm /var/lib/sddm
+fi
+
+# ---------------------------------------------------------------------------
+# Recovery UKI: kernel + minimal initramfs that applies a staged update from
+# the root partition before the running system is booted. Built with the same
+# tools mkosi uses for the main UKI (systemd-ukify + systemd-stub), placed
+# into /boot so the ESP assembly (CopyFiles=/boot:/) ships it as
+# /EFI/Linux/arcex-recovery.efi. mkosi does not know about this UKI, so our
+# seeded grub.cfg (mkosi.extra/efi/grub/grub.cfg) is what chainloads it.
+# ---------------------------------------------------------------------------
+
+kernel_images=(/usr/lib/modules/*/vmlinuz)
+[[ -n "${kernel_images[0]:-}" && -e "${kernel_images[0]}" ]] || {
+    echo "mkosi.postinst: no kernel found in /usr/lib/modules - skipping recovery UKI" >&2
+    exit 1
+}
+
+KVER="${kernel_images[0]%/*}"
+KVER="${KVER##*/}"
+: "${EFI_ARCHITECTURE:=x64}"
+
+echo "mkosi.postinst: building recovery initramfs for kernel $KVER"
+mkinitcpio -c /etc/initcpio/arcex-update.conf -k "$KVER" -g /tmp/arcex-update.img
+
+initrd="$(ls -t /tmp/arcex-update.img* | head -n 1)"
+[[ -n "$initrd" && -e "$initrd" ]] || {
+    echo "mkosi.postinst: recovery initramfs was not generated" >&2
+    exit 1
+}
+
+mkdir -p /boot/EFI/Linux
+
+echo "mkosi.postinst: building recovery UKI (cmdline: arcex.update)"
+printf 'arcex.update\0' > /tmp/arcex-update.cmdline
+python3 /usr/lib/systemd/ukify build \
+    --os-release @/usr/lib/os-release \
+    --uname "$KVER" \
+    --linux "/usr/lib/modules/$KVER/vmlinuz" \
+    --initrd "$initrd" \
+    --efi-arch "$EFI_ARCHITECTURE" \
+    --stub "/usr/lib/systemd/boot/efi/linux${EFI_ARCHITECTURE}.efi.stub" \
+    --output /boot/EFI/Linux/arcex-recovery.efi \
+    --cmdline @/tmp/arcex-update.cmdline
+
+rm -f /tmp/arcex-update.img* /tmp/arcex-update.cmdline
+
+# The kernel package's own install hook may have generated stock
+# vmlinuz/initramfs for the main kernel; those belong to the mkinitcpio
+# default flow, not our GRUB/recovery UKI scheme, and /boot is copied onto
+# the ESP verbatim - throw them away so the ESP stays lean and we never
+# accidentally ship a second, unmanaged kernel+initramfs pair.
+rm -f /boot/vmlinuz-* /boot/initramfs-* /boot/config-* /boot/System.map-*
+find /boot/EFI/Linux -maxdepth 1 -type f -name '*.efi' ! -name 'arcex*' -delete 2>/dev/null || true

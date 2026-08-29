@@ -1,0 +1,5 @@
+# arceX user presets: full audio out of the box for every login (PipeWire
+# as the session sound server + PulseAudio-compatible layer via WirePlumber).
+enable pipewire.socket
+enable pipewire-pulse.socket
+enable wireplumber.service

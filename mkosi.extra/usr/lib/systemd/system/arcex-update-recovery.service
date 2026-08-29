@@ -1,0 +1,15 @@
+[Unit]
+Description=arceX staged-update recovery
+ConditionKernelCommandLine=arcex.update
+DefaultDependencies=no
+Wants=systemd-udevd.service
+After=systemd-udevd.service systemd-tmpfiles-setup-dev.service
+Before=initrd-root-device.target sysroot.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/arcex/update-recovery.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=initrd.target

@@ -1,0 +1,42 @@
+#!/bin/bash
+# mkinitcpio install hook: pull arceX staged-update recovery tooling and the
+# utilities it needs into the initramfs.
+
+build() {
+    add_binary bash
+    add_binary mount
+    add_binary umount
+    add_binary sed
+    add_binary basename
+    add_binary ls
+    add_binary sort
+    add_binary tail
+    add_binary sha256sum
+    add_binary blockdev
+    add_binary dd
+    add_binary sgdisk
+    add_binary partx
+    add_binary btrfs
+    add_binary awk
+    add_binary cat
+    add_binary head
+    add_binary wc
+    add_binary cut
+    add_binary sleep
+    add_binary seq
+    add_binary sync
+    add_binary cp
+    add_binary rm
+    add_binary mv
+    add_binary mkdir
+    add_binary readlink
+    add_binary udevadm
+    add_binary zstd
+
+    add_file /usr/lib/arcex/update-recovery.sh /usr/lib/arcex/update-recovery.sh
+    add_file /usr/lib/arcex/write-grub-cfg.sh /usr/lib/arcex/write-grub-cfg.sh
+}
+
+help() {
+    echo "Adds the arceX staged-update recovery tooling to the initramfs."
+}

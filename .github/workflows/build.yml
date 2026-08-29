@@ -1,0 +1,427 @@
+# arceX — single-image mkosi build + release orchestration (GitHub Actions)
+#
+# CI:          every push to main and every pull request runs a full mkosi
+#              build to catch breakage. Artifacts are only uploaded on non-PR
+#              runs.
+# Publish:     pushing a tag matching v* triggers a build + draft release.
+# Manual:      Actions -> build -> Run workflow.
+#
+# Delivery:    images are uploaded to storage.to for short-lived shareable
+#              links (7-day expiry, anonymous), plus the usual GitHub Actions
+#              artifact in the run. Tag pushes additionally attach the artifact
+#              files to a draft GitHub Release. Uploads are best-effort: if an
+#              upload fails the build still succeeds and the situation is
+#              reported instead of guessing a replacement.
+#
+# Retention:   a `cleanup` job keeps the newest 2 builds' storage.to artifacts
+#              and deletes older ones using the owner token each upload returns.
+#              Cross-run state (file ids + owner tokens) is persisted on the
+#              `storage-state` branch.
+#
+# No repo secrets required.
+
+# Cancel any in-flight run for the same ref when a newer one starts (e.g. a
+# new push to main while the previous build is still running).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+name: build
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Image version (e.g. v0.1.0). Defaults to tag name or timestamp.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_ok: ${{ steps.artifacts.outcome == 'success' }}
+      storage_ok: ${{ steps.storage.outcome == 'success' }}
+      uploads_path: ${{ steps.storage.outputs.UPLOADS_PATH }}
+    container:
+      image: cachyos/cachyos-v3:latest
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="$(date -u +%Y.%m.%d)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install build tooling
+        shell: bash
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux cachyos
+          pacman -Syu --noconfirm --needed \
+            mkosi systemd-ukify erofs-utils btrfs-progs dosfstools mtools \
+            squashfs-tools cpio jq git
+
+      - name: Build image
+        shell: bash
+        env:
+          MKOSI_IMAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkosi --image-version="$MKOSI_IMAGE_VERSION" build
+          ls -lh mkosi.output/
+
+      - name: Compress image artifact
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          for img in mkosi.output/*.raw; do
+            zstd -f -T0 -19 "$img"
+          done
+          ls -lh mkosi.output/
+
+      - name: Generate checksums
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          cd mkosi.output
+          sha256sum * > SHA256SUMS
+          sort -k2 SHA256SUMS | tee /dev/stderr > /dev/null
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          compgen -G "mkosi.output/arcex_${{ steps.version.outputs.version }}_*.raw" >/dev/null
+          compgen -G "mkosi.output/arcex_${{ steps.version.outputs.version }}_*_arcex_usr.raw" >/dev/null
+          compgen -G "mkosi.output/arcex_${{ steps.version.outputs.version }}_*.manifest.json" >/dev/null \
+            || ls mkosi.output/
+
+      # Delivery: storage.to. Anonymous upload of the raw disk images + split
+      # /usr + manifest + checksums for shareable download links. Raw (not
+      # zstd) so a user can `dd` the image straight onto disk. Best-effort: if
+      # the upload fails the build still succeeds, and the URLs land in the
+      # step summary.
+      - name: Upload to storage.to
+        id: storage
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          VISITOR_TOKEN=$(uuidgen)
+          BASE=https://storage.to/api
+
+          MIME_OF() {
+            case "$1" in
+              SHA256SUMS)        echo text/plain ;;
+              *.manifest.json)   echo application/json ;;
+              *)                 echo application/octet-stream ;;
+            esac
+          }
+
+          # Upload a single file (single or multipart) and print its URL.
+          upload_file() {
+            local f="$1" SIZE MIME INIT TYPE R2_KEY
+            SIZE=$(stat -c%s "$f")
+            MIME=$(MIME_OF "$(basename "$f")")
+
+            INIT=$(curl -fsSL -X POST "$BASE/upload/init" \
+              -H 'Content-Type: application/json' \
+              -H "X-Visitor-Token: $VISITOR_TOKEN" \
+              -d "{\"filename\":\"$(basename "$f")\",\"content_type\":\"$MIME\",\"size\":$SIZE}")
+            TYPE=$(echo "$INIT" | jq -r '.type')
+            R2_KEY=$(echo "$INIT" | jq -r '.r2_key')
+
+            if [ "$TYPE" = "single" ]; then
+              UPLOAD_URL=$(echo "$INIT" | jq -r '.upload_url')
+              curl --fail --retry 10 --retry-all-errors --retry-delay 5 \
+                --upload-file "$f" "$UPLOAD_URL"
+            elif [ "$TYPE" = "multipart" ]; then
+              UPLOAD_ID=$(echo "$INIT" | jq -r '.upload_id')
+              PART_SIZE=$(echo "$INIT" | jq -r '.part_size')
+              TOTAL_PARTS=$(echo "$INIT" | jq -r '.total_parts')
+              rm -rf ./parts && mkdir -p ./parts
+              split -b "$PART_SIZE" -d -a 5 "$f" ./parts/part_
+              ETAGS=$(mktemp)
+              for i in $(seq 1 "$TOTAL_PARTS"); do
+                URL=$(echo "$INIT" | jq -r ".initial_urls[\"$i\"]")
+                if [ "$URL" = "null" ] || [ -z "$URL" ]; then
+                  URL=$(curl -fsSL -X POST "$BASE/upload/parts" \
+                    -H 'Content-Type: application/json' \
+                    -d "{\"upload_id\":\"$UPLOAD_ID\",\"part_numbers\":[$i]}" \
+                    | jq -r '.part_urls[0].url')
+                fi
+                HDR=$(mktemp)
+                curl --fail --retry 10 --retry-all-errors --retry-delay 5 -D "$HDR" \
+                  --upload-file "$(printf './parts/part_%05d' $((i-1)))" "$URL"
+                ETAG=$(grep -i ETag "$HDR" | cut -d' ' -f2- | tr -d '\r')
+                echo "{\"partNumber\":$i,\"etag\":$ETAG}" >> "$ETAGS"
+                rm -f "$HDR"
+              done
+              curl -fsSL -X POST "$BASE/upload/complete-multipart" \
+                -H 'Content-Type: application/json' \
+                -d "{\"upload_id\":\"$UPLOAD_ID\",\"parts\":$(jq -s '.' "$ETAGS")}"
+            else
+              echo "Unknown upload type: $TYPE" >&2
+              return 1
+            fi
+
+            CONFIRM=$(curl -fsSL -X POST "$BASE/upload/confirm" \
+              -H 'Content-Type: application/json' \
+              -H "X-Visitor-Token: $VISITOR_TOKEN" \
+              -d "{\"filename\":\"$(basename "$f")\",\"content_type\":\"$MIME\",\"size\":$SIZE,\"r2_key\":\"$R2_KEY\",\"expiry_days\":7}")
+
+            FID=$(echo "$CONFIRM" | jq -r '.file.id')
+            URL=$(echo "$CONFIRM" | jq -r '.file.url')
+            TOKEN=$(echo "$CONFIRM" | jq -r '.owner_token')
+
+            echo "  $f -> $URL"
+            FILES=$(echo "$FILES" | jq -c \
+              --arg id "$FID" --arg tok "$TOKEN" --arg url "$URL" --arg name "$(basename "$f")" \
+              '.files += [{id:$id,owner_token:$tok,url:$url,name:$name}]')
+          }
+
+          FILES='{"ts":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","version":"'"${{ steps.version.outputs.version }}"'","files":[]}'
+
+          echo "## storage.to download links (expire in 7 days)" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r img; do
+            upload_file "$img"
+          done < <({ printf '%s\n' mkosi.output/*.raw; \
+                      printf '%s\n' mkosi.output/*.manifest.json; \
+                      [ -f mkosi.output/SHA256SUMS ] && printf '%s\n' mkosi.output/SHA256SUMS; } | sort)
+
+          echo "$FILES" > "$RUNNER_TEMP/uploads.json"
+          echo "UPLOADS_PATH=$RUNNER_TEMP/uploads.json" >> "$GITHUB_OUTPUT"
+
+      - name: Upload storage record artifact
+        if: github.event_name != 'pull_request' && steps.storage.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-uploads
+          path: ${{ steps.storage.outputs.UPLOADS_PATH }}
+          if-no-files-found: error
+
+      # Delivery: GitHub Actions artifact. Best-effort - the 500 MB/repo
+      # artifact quota may reject large images; the build still succeeds and
+      # reports what happened.
+      - name: Upload artifacts to Actions
+        id: artifacts
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkosi.output
+          path: mkosi.output
+          if-no-files-found: error
+
+      - name: Note upload outcome
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          if [[ "${{ steps.artifacts.outcome }}" != "success" ]]; then
+            printf '**GitHub artifact upload failed (likely the 500 MB/repo quota) - nothing was stored this run. Re-run the workflow on the tag, or build locally.**\n' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '## Downloads\n\nGrab the images from the **Artifacts** section of this run (Actions -> build -> this run), plus a `SHA256SUMS` file to verify them.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        if: needs.build.outputs.artifact_ok == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: mkosi.output
+          path: mkosi.output
+
+      - name: Prepare release notes
+        id: notes
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP"
+          if [[ "${{ needs.build.outputs.artifact_ok }}" == "true" ]]; then
+            printf '## Downloads\n\nImages attached to this release (from the CI run artifact). Verify with `sha256sum -c SHA256SUMS`.\n\n- `arcex_<ver>_x86-64.raw.zst` - full flash image (`zstd -d`, then dd)\n- `arcex_<ver>_x86-64_arcex_usr.raw.zst` - split /usr partition for `ace-update`\n- `arcex_<ver>_x86-64.raw` - uncompressed, dd-able as-is\n' > "$RUNNER_TEMP/body.md"
+          else
+            printf '**The GitHub artifact upload failed in the build job (likely the 500 MB/repo artifact quota), so there is nothing to attach here. Re-run the workflow on this tag, or build locally and flash that image.**\n' > "$RUNNER_TEMP/body.md"
+          fi
+          echo "body_path=$RUNNER_TEMP/body.md" >> "$GITHUB_OUTPUT"
+
+      - name: Draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mkosi.output/**/*
+          draft: true
+          body_path: ${{ steps.notes.outputs.body_path }}
+
+  # Retention: keep the newest 2 builds' storage.to artifacts, delete older
+  # ones. Cross-run state lives on the `storage-state` branch (uploads.json).
+  cleanup:
+    if: github.event_name != 'pull_request' && needs.build.outputs.storage_ok == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download uploads record
+        uses: actions/download-artifact@v4
+        with:
+          name: storage-uploads
+          path: ./record
+        continue-on-error: true
+
+      - name: Load and trim record
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 1) Start from the storage-state branch, if it exists.
+          git clone --depth 1 --branch storage-state \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" state \
+            || true
+          if [ ! -d state/.git ]; then
+            mkdir -p state && (cd state && git init -b storage-state)
+          fi
+
+          # 2) Current run's uploads (from the storage-uploads artifact).
+          NEW='{"ts":"","version":"","files":[]}'
+          [ -f record/uploads.json ] && NEW=$(cat record/uploads.json)
+
+          OLD='{"builds":[]}'
+          [ -f state/uploads.json ] && OLD=$(cat state/uploads.json)
+
+          # 3) Newest-first: [this run] + existing, dedupe by ts, keep 2.
+          PREFIX=$(echo "$NEW" | jq -c '{ts:.ts,version:.version,files:.files}')
+          BUILDS=$(echo "$OLD" | jq -c --argjson n "$PREFIX" '{builds: ( [$n] + .builds | unique_by(.ts) | .[:2] )}')
+
+          # 4) Dropped files = any file in the old record whose build is gone.
+          DROPPED=$(echo "$OLD" | jq -c --argjson k "$BUILDS" \
+            '[.builds[].files[] as $f | select([$k.builds[].files[].id] | index($f.id) | not) | $f]')
+
+          echo "Old builds:   $(echo "$OLD"     | jq -r '.builds|length')"
+          echo "Kept builds:  $(echo "$BUILDS"  | jq -r '.builds|length')"
+          echo "Dropped files: $(echo "$DROPPED" | jq -r 'length')"
+
+          echo '{"dropped":'"$DROPPED"'}' | jq -c . > /tmp/retention.json
+
+          echo "$BUILDS" > state/uploads.json
+          cat state/uploads.json
+
+      - name: Delete dropped files from storage.to
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          jq -c '.dropped[]' /tmp/retention.json |
+            while IFS= read -r f; do
+              id=$(echo "$f" | jq -r .id)
+              tok=$(echo "$f" | jq -r .owner_token)
+              echo "Deleting $id ($(echo "$f" | jq -r .name))"
+              curl -fsS -X DELETE "https://storage.to/api/file/$id" \
+                -H "X-Owner-Token: $tok" \
+                || echo "  (skip: not deletable/expired)"
+            done
+
+      - name: Commit trimmed record
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd state
+          git add uploads.json
+          if git diff --cached --quiet; then
+            echo "No change to state"
+            exit 0
+          fi
+          git commit -m "Trim storage.to retention to newest 2 builds"
+          git push --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            storage-state
+  # Publish a stable `releases.json` manifest of the latest build's storage.to
+  # download links to the `storage-state` branch, alongside the raw retention
+  # record. Consumers (docs, update preflight) can read
+  #   https://raw.githubusercontent.com/<repo>/storage-state/releases.json
+  # for the newest shareable URLs. Best-effort: a publish failure never fails
+  # the build (the links are already in the run summary + draft release).
+  publish_release:
+    if: github.event_name != 'pull_request' && needs.build.outputs.storage_ok == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download uploads record
+        uses: actions/download-artifact@v4
+        with:
+          name: storage-uploads
+          path: ./record
+
+      - name: Publish releases.json to storage-state
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # Start from storage-state branch, or seed it fresh if it doesn't exist.
+          rm -rf state
+          if ! git clone --depth 1 --branch storage-state "$REMOTE" state 2>/dev/null; then
+            mkdir -p state && (cd state && git init -b storage-state)
+          fi
+
+          # This run's uploads.json -> releases.json manifest.
+          NEW='{"ts":"","version":"","files":[]}'
+          [ -f record/uploads.json ] && NEW=$(cat record/uploads.json)
+
+          TS=$(echo "$NEW" | jq -r .ts)
+          VER=$(echo "$NEW" | jq -r .version)
+          FILES=$(echo "$NEW" | jq -c .files)
+
+          # Merge with prior manifest: this run becomes the new "latest",
+          # older entries stay in history keyed by version.
+          OLD='{"releases":[]}'
+          [ -f state/releases.json ] && OLD=$(cat state/releases.json)
+          MANIFEST=$(jq -n --arg ts "$TS" --arg ver "$VER" --argjson files "$FILES" --argjson old "$OLD" \
+            '{latest:{ts:$ts,version:$ver,files:$files},
+              releases: ([{ts:$ts,version:$ver,files:$files}] + $old.releases | unique_by(.version))}')
+
+          echo "$MANIFEST" | jq . > state/releases.json
+
+          cd state
+          git add releases.json
+          if git diff --cached --quiet; then
+            echo "No change to releases.json"
+            exit 0
+          fi
+          git commit -m "Publish release links for $VER"
+          git push --force "$REMOTE" storage-state
+
+          {
+            echo "## Release links"
+            echo
+            echo "$MANIFEST" | jq -r '.latest.files[] | "- `\(.name)` → \(.url)"'
+          } >> "$GITHUB_STEP_SUMMARY"

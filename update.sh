@@ -1,0 +1,1 @@
+mkosi.extra/usr/lib/arcex/update.sh

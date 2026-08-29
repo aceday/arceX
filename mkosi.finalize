@@ -1,0 +1,34 @@
+#!/bin/bash
+
+set -euo pipefail
+
+find_image_root() {
+    local candidate
+
+    for candidate in "${1:-}" "${BUILDROOT:-}" "${MKOSI_ROOT:-}" "${IMAGE_ROOT:-}" "${DESTDIR:-}"; do
+        [[ -n "${candidate}" ]] || continue
+        [[ -d "${candidate}" ]] || continue
+
+        if [[ -f "${candidate}/usr/lib/arcex/write-grub-cfg.sh" &&
+              -f "${candidate}/efi/grub/grub.cfg" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+image_root="$(find_image_root "${1:-}")" || {
+    echo "Unable to determine mkosi image root for grub.cfg regeneration" >&2
+    exit 1
+}
+
+# mkosi appends a per-version chainload entry to the grub.cfg seed when it
+# installs the UKI; regenerate the config from the arceX template so the
+# shipped firmware only sees the Boot/Update/Boot Windows menu.
+#
+# There is intentionally no first-boot regrow here anymore: root is baked to
+# its final size (p2, remainder of the disk) and /usr is the LAST partition,
+# so a future update can simply extend /usr in place (see update-recovery.sh).
+bash "${image_root}/usr/lib/arcex/write-grub-cfg.sh" "${image_root}/efi"
