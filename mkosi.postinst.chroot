@@ -36,6 +36,7 @@ systemd-sysusers || true
 groupadd -f wheel
 useradd --create-home --groups wheel --shell /usr/bin/fish ace
 echo 'ace:acex' | chpasswd
+echo 'root:rootx' | chpasswd
 grep -qxF '/usr/bin/fish' /etc/shells || echo '/usr/bin/fish' >> /etc/shells
 printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-arcex-wheel
 chmod 440 /etc/sudoers.d/10-arcex-wheel
