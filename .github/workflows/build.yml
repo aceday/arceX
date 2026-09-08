@@ -1,0 +1,31 @@
+name: Build ISO
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm archiso git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ISO
+        run: mkarchiso -w work -o out .
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: archx-iso
+          path: out/*.iso
+          retention-days: 30
