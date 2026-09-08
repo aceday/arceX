@@ -43,6 +43,7 @@ irssi
 iw
 iwd
 jfsutils
+kate
 kitty-terminfo
 kmscon-terminfo
 ldns
@@ -73,6 +74,7 @@ mtools
 nano
 nbd
 ndisc6
+network-manager-applet
 nfs-utils
 nilfs-utils
 nmap
@@ -88,6 +90,8 @@ partclone
 parted
 partimage
 pcsclite
+plasma
+plasma-systemmonitor
 ppp
 pptpclient
 pv
@@ -98,6 +102,7 @@ rsync
 rxvt-unicode-terminfo
 screen
 sdparm
+sddm
 sequoia-sq
 sg3_utils
 smartmontools
@@ -126,4 +131,7 @@ wvdial
 xdg-utils
 xfsprogs
 xl2tpd
+xorg-server
+xorg-xinit
+xorg-xrandr
 zsh
